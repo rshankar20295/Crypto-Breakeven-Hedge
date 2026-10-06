@@ -6,7 +6,10 @@ import threading
 import time
 from decimal import Decimal
 
-import websocket
+try:
+    import websocket
+except ImportError:  # pragma: no cover - only used when dependencies are not installed locally.
+    websocket = None
 
 from app.config import Settings
 from app.models import dec
@@ -25,6 +28,9 @@ class LivePriceFeed:
 
     def start(self) -> None:
         if self._started:
+            return
+        if websocket is None:
+            LOG.warning("websocket-client is not installed; using REST price fallback only")
             return
         self._started = True
         thread = threading.Thread(target=self._run_forever, name="delta-price-feed", daemon=True)

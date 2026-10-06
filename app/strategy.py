@@ -43,7 +43,11 @@ class BreakevenHedgeBot:
             LOG.info("cycle %s marked settled at configured cutoff %s", cycle.cycle_id, cycle.expiry_cutoff_time)
             return
 
-        if cycle and cycle.status in {"active", "hedging"}:
+        if cycle and cycle.status == "entering":
+            self._resume_entry(cycle)
+            return
+
+        if cycle and cycle.status in {"active", "hedging", "closing"}:
             self._monitor_cycle(cycle)
             return
 
@@ -56,7 +60,7 @@ class BreakevenHedgeBot:
         expiry_date = self._select_expiry_date()
         cycle_id = f"{self.settings.underlying_symbol}-{expiry_date}-E{self.settings.entry_time.replace(':', '')}"
         existing = self.store.load_cycle(cycle_id)
-        if existing and existing.status not in {"settled", "failed"}:
+        if existing and existing.status not in {"settled", "failed", "closed"}:
             LOG.info("cycle already exists and is not settled: %s", cycle_id)
             return
 
@@ -70,6 +74,30 @@ class BreakevenHedgeBot:
 
         call_oid = self._client_oid(cycle_id, "EC")
         put_oid = self._client_oid(cycle_id, "EP")
+        initial_cycle = CycleState(
+            cycle_id=cycle_id,
+            status="entering",
+            underlying=self.settings.underlying_symbol,
+            expiry_date=expiry_date,
+            quantity=quantity,
+            call_symbol=call.symbol,
+            call_product_id=call.product_id,
+            call_strike=call.strike,
+            put_symbol=put.symbol,
+            put_product_id=put.product_id,
+            put_strike=put.strike,
+            premium_per_lot=premium_per_lot,
+            premium_multiplier=multiplier,
+            target_max_profit=self.settings.target_max_profit_usd,
+            actual_max_profit=estimated_profit,
+            upper_breakeven=call.strike + premium_per_lot,
+            lower_breakeven=put.strike - premium_per_lot,
+            entry_time=now.isoformat(),
+            expiry_cutoff_time=self.settings.expiry_cutoff_time,
+            call_entry_client_oid=call_oid,
+            put_entry_client_oid=put_oid,
+        )
+        self.store.save_cycle(initial_cycle)
         LOG.info(
             "entry selected expiry=%s call=%s delta=%s bid=%s put=%s delta=%s bid=%s qty=%s target_profit=%s estimated_profit=%s",
             expiry_date,
@@ -84,57 +112,90 @@ class BreakevenHedgeBot:
             estimated_profit,
         )
 
-        call_order = self.client.place_order(call.product_id, "sell", quantity, call_oid, self.settings.entry_order_type)
-        put_order = self.client.place_order(put.product_id, "sell", quantity, put_oid, self.settings.entry_order_type)
-        self.store.record_order(cycle_id, "entry_call", call_oid, call_order)
-        self.store.record_order(cycle_id, "entry_put", put_oid, put_order)
+        self._resume_entry(initial_cycle, call_quote=call, put_quote=put)
 
-        call_filled, _, call_fill_price = self.client.wait_for_fill(call_oid, quantity)
-        put_filled, _, put_fill_price = self.client.wait_for_fill(put_oid, quantity)
+    def _resume_entry(
+        self,
+        cycle: CycleState,
+        call_quote: OptionQuote | None = None,
+        put_quote: OptionQuote | None = None,
+    ) -> None:
+        call_fill_price = Decimal("0")
+        put_fill_price = Decimal("0")
+
+        call_order = self.client.get_order_by_client_oid(cycle.call_entry_client_oid)
+        if not call_order:
+            call_order = self.client.place_order(cycle.call_product_id, "sell", cycle.quantity, cycle.call_entry_client_oid, self.settings.entry_order_type)
+        self.store.record_order(cycle.cycle_id, "entry_call", cycle.call_entry_client_oid, call_order)
+
+        put_order = self.client.get_order_by_client_oid(cycle.put_entry_client_oid)
+        if not put_order:
+            put_order = self.client.place_order(cycle.put_product_id, "sell", cycle.quantity, cycle.put_entry_client_oid, self.settings.entry_order_type)
+        self.store.record_order(cycle.cycle_id, "entry_put", cycle.put_entry_client_oid, put_order)
+
+        call_filled, _, call_fill_price = self.client.wait_for_fill(cycle.call_entry_client_oid, cycle.quantity)
+        put_filled, _, put_fill_price = self.client.wait_for_fill(cycle.put_entry_client_oid, cycle.quantity)
         if not call_filled or not put_filled:
-            LOG.warning("entry not fully filled yet; will retry monitoring next loop")
+            LOG.warning("ENTRY_NOT_FILLED | cycle=%s | call_filled=%s | put_filled=%s | retrying=true", cycle.cycle_id, call_filled, put_filled)
             return
 
         if self.settings.dry_run:
-            call_fill_price = call.sell_price
-            put_fill_price = put.sell_price
+            fallback_price = cycle.premium_per_lot / cycle.premium_multiplier / Decimal("2")
+            call_fill_price = call_quote.sell_price if call_quote else fallback_price
+            put_fill_price = put_quote.sell_price if put_quote else fallback_price
 
-        actual_premium_per_lot = (call_fill_price + put_fill_price) * multiplier
-        upper_be = call.strike + actual_premium_per_lot
-        lower_be = put.strike - actual_premium_per_lot
-        cycle = CycleState(
-            cycle_id=cycle_id,
+        if call_fill_price <= 0 or put_fill_price <= 0:
+            LOG.warning(
+                "ENTRY_FILL_PRICE_MISSING | cycle=%s | call_fill=%s | put_fill=%s | fallback=estimated_premium_split",
+                cycle.cycle_id,
+                call_fill_price,
+                put_fill_price,
+            )
+            call_fill_price = cycle.premium_per_lot / cycle.premium_multiplier / Decimal("2")
+            put_fill_price = cycle.premium_per_lot / cycle.premium_multiplier / Decimal("2")
+
+        actual_premium_per_lot = (call_fill_price + put_fill_price) * cycle.premium_multiplier
+        upper_be = cycle.call_strike + actual_premium_per_lot
+        lower_be = cycle.put_strike - actual_premium_per_lot
+        active_cycle = CycleState(
+            cycle_id=cycle.cycle_id,
             status="active",
-            underlying=self.settings.underlying_symbol,
-            expiry_date=expiry_date,
-            quantity=quantity,
-            call_symbol=call.symbol,
-            call_product_id=call.product_id,
-            call_strike=call.strike,
-            put_symbol=put.symbol,
-            put_product_id=put.product_id,
-            put_strike=put.strike,
+            underlying=cycle.underlying,
+            expiry_date=cycle.expiry_date,
+            quantity=cycle.quantity,
+            call_symbol=cycle.call_symbol,
+            call_product_id=cycle.call_product_id,
+            call_strike=cycle.call_strike,
+            put_symbol=cycle.put_symbol,
+            put_product_id=cycle.put_product_id,
+            put_strike=cycle.put_strike,
             premium_per_lot=actual_premium_per_lot,
-            premium_multiplier=multiplier,
-            target_max_profit=self.settings.target_max_profit_usd,
-            actual_max_profit=actual_premium_per_lot * quantity,
+            premium_multiplier=cycle.premium_multiplier,
+            target_max_profit=cycle.target_max_profit,
+            actual_max_profit=actual_premium_per_lot * cycle.quantity,
             upper_breakeven=upper_be,
             lower_breakeven=lower_be,
-            entry_time=now.isoformat(),
-            expiry_cutoff_time=self.settings.expiry_cutoff_time,
-            call_entry_client_oid=call_oid,
-            put_entry_client_oid=put_oid,
+            entry_time=cycle.entry_time,
+            expiry_cutoff_time=cycle.expiry_cutoff_time,
+            call_entry_client_oid=cycle.call_entry_client_oid,
+            put_entry_client_oid=cycle.put_entry_client_oid,
         )
-        self.store.save_cycle(cycle)
+        self.store.save_cycle(active_cycle)
         LOG.info(
-            "entry complete cycle=%s actual_max_profit=%s upper_be=%s lower_be=%s",
-            cycle.cycle_id,
-            cycle.actual_max_profit,
-            cycle.upper_breakeven,
-            cycle.lower_breakeven,
+            "ENTRY_CONFIRMED | cycle=%s | actual_max_profit=%s | upper_be=%s | lower_be=%s | qty=%s",
+            active_cycle.cycle_id,
+            active_cycle.actual_max_profit,
+            active_cycle.upper_breakeven,
+            active_cycle.lower_breakeven,
+            active_cycle.quantity,
         )
 
     def _monitor_cycle(self, cycle: CycleState) -> None:
+        if cycle.status == "closing":
+            LOG.critical("EMERGENCY_CLOSE_RESUME | cycle=%s | reason=previous_close_not_confirmed", cycle.cycle_id)
+            self._emergency_close_cycle(cycle, reason="resume_closing_state")
+            return
+
         spot = self._spot_price()
         up_left = self._percent_left(spot, cycle.upper_breakeven, upside=True)
         down_left = self._percent_left(spot, cycle.lower_breakeven, upside=False)
@@ -208,6 +269,16 @@ class BreakevenHedgeBot:
                     self.settings.order_retry_seconds,
                 )
             except Exception as exc:
+                if self._is_funds_error(exc):
+                    LOG.critical(
+                        "HEDGE_FUNDS_FAILURE | side=%s | symbol=%s | qty=%s | error=%s | action=close_all_existing_positions",
+                        side,
+                        hedge.symbol,
+                        cycle.quantity,
+                        exc,
+                    )
+                    self._emergency_close_cycle(cycle, reason=f"{side}_hedge_funds_failure")
+                    return
                 LOG.critical(
                     "HEDGE_ORDER_FAILED | side=%s | attempt=%s | symbol=%s | qty=%s | error=%s | retry_in=%ss | position_is_unhedged=true",
                     side,
@@ -231,6 +302,124 @@ class BreakevenHedgeBot:
         cycle.status = "active"
         self.store.save_cycle(cycle)
         LOG.info("HEDGE_CONFIRMED | side=%s | symbol=%s | client_oid=%s", side, symbol, oid)
+
+    def _emergency_close_cycle(self, cycle: CycleState, reason: str) -> None:
+        cycle.status = "closing"
+        self.store.save_cycle(cycle)
+        LOG.critical(
+            "EMERGENCY_CLOSE_STARTED | cycle=%s | reason=%s | qty=%s | call=%s | put=%s | up_hedge=%s | down_hedge=%s",
+            cycle.cycle_id,
+            reason,
+            cycle.quantity,
+            cycle.call_symbol,
+            cycle.put_symbol,
+            cycle.upside_hedge_symbol or "none",
+            cycle.downside_hedge_symbol or "none",
+        )
+
+        close_plan = [
+            ("close_short_call", cycle.call_product_id, "buy", cycle.quantity, self._client_oid(cycle.cycle_id, "CC")),
+            ("close_short_put", cycle.put_product_id, "buy", cycle.quantity, self._client_oid(cycle.cycle_id, "CP")),
+        ]
+
+        chain: list[OptionQuote] | None = None
+        if cycle.upside_hedge_symbol:
+            chain = chain or self.client.get_option_chain(cycle.underlying, cycle.expiry_date)
+            close_plan.append(
+                (
+                    "close_long_upside_hedge",
+                    self._product_id_for_symbol(chain, cycle.upside_hedge_symbol),
+                    "sell",
+                    cycle.quantity,
+                    self._client_oid(cycle.cycle_id, "CU"),
+                )
+            )
+        if cycle.downside_hedge_symbol:
+            chain = chain or self.client.get_option_chain(cycle.underlying, cycle.expiry_date)
+            close_plan.append(
+                (
+                    "close_long_downside_hedge",
+                    self._product_id_for_symbol(chain, cycle.downside_hedge_symbol),
+                    "sell",
+                    cycle.quantity,
+                    self._client_oid(cycle.cycle_id, "CD"),
+                )
+            )
+
+        for role, product_id, side, qty, oid in close_plan:
+            self._place_until_filled(cycle, role, product_id, side, qty, oid, self.settings.hedge_order_type)
+
+        cycle.status = "closed"
+        self.store.save_cycle(cycle)
+        LOG.critical("EMERGENCY_CLOSE_CONFIRMED | cycle=%s | reason=%s | status=closed", cycle.cycle_id, reason)
+
+    def _place_until_filled(
+        self,
+        cycle: CycleState,
+        role: str,
+        product_id: int,
+        side: str,
+        qty: int,
+        oid: str,
+        order_type: str,
+    ) -> None:
+        attempts = 0
+        while True:
+            attempts += 1
+            order = self.client.get_order_by_client_oid(oid)
+            if order:
+                self.store.record_order(cycle.cycle_id, role, oid, order)
+                size = int(order.get("size") or qty)
+                unfilled = int(order.get("unfilled_size") or 0)
+                filled = max(0, size - unfilled)
+                if filled >= qty:
+                    LOG.critical("EMERGENCY_CLOSE_LEG_CONFIRMED | role=%s | side=%s | qty=%s | client_oid=%s", role, side, qty, oid)
+                    return
+                LOG.critical(
+                    "EMERGENCY_CLOSE_LEG_PENDING | role=%s | side=%s | filled=%s | required=%s | retry_in=%ss",
+                    role,
+                    side,
+                    filled,
+                    qty,
+                    self.settings.order_retry_seconds,
+                )
+                time.sleep(self.settings.order_retry_seconds)
+                continue
+
+            LOG.critical(
+                "EMERGENCY_CLOSE_LEG_REQUIRED | role=%s | attempt=%s | side=%s | product_id=%s | qty=%s | client_oid=%s",
+                role,
+                attempts,
+                side,
+                product_id,
+                qty,
+                oid,
+            )
+            try:
+                placed = self.client.place_order(product_id, side, qty, oid, order_type)
+                self.store.record_order(cycle.cycle_id, role, oid, placed)
+                filled, filled_size, _ = self.client.wait_for_fill(oid, qty)
+                if filled:
+                    LOG.critical("EMERGENCY_CLOSE_LEG_CONFIRMED | role=%s | side=%s | qty=%s | client_oid=%s", role, side, qty, oid)
+                    return
+                LOG.critical(
+                    "EMERGENCY_CLOSE_LEG_NOT_FILLED | role=%s | side=%s | filled=%s | required=%s | retry_in=%ss",
+                    role,
+                    side,
+                    filled_size,
+                    qty,
+                    self.settings.order_retry_seconds,
+                )
+            except Exception as exc:
+                LOG.critical(
+                    "EMERGENCY_CLOSE_LEG_FAILED | role=%s | side=%s | qty=%s | error=%s | retry_in=%ss | close_still_required=true",
+                    role,
+                    side,
+                    qty,
+                    exc,
+                    self.settings.order_retry_seconds,
+                )
+            time.sleep(self.settings.order_retry_seconds)
 
     def _select_expiry_date(self) -> str:
         products = self.client.get_products()
@@ -265,6 +454,13 @@ class BreakevenHedgeBot:
         if not options:
             raise RuntimeError(f"No {contract_type} options found for hedge.")
         return min(options, key=lambda q: (abs(q.strike - target), q.strike))
+
+    @staticmethod
+    def _product_id_for_symbol(chain: list[OptionQuote], symbol: str) -> int:
+        for quote in chain:
+            if quote.symbol == symbol:
+                return quote.product_id
+        raise RuntimeError(f"Could not find product_id for hedge symbol {symbol}.")
 
     def _premium_multiplier(self, call: OptionQuote, put: OptionQuote) -> Decimal:
         if not self.settings.use_contract_value_multiplier:
@@ -335,4 +531,9 @@ class BreakevenHedgeBot:
     def _client_oid(cycle_id: str, role: str) -> str:
         compact = cycle_id.replace("-", "").replace(":", "")
         return f"{role}{compact}"[:32]
+
+    @staticmethod
+    def _is_funds_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(token in text for token in ["insufficient", "margin", "fund", "balance", "collateral"])
 

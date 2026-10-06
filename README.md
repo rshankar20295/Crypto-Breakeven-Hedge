@@ -120,6 +120,8 @@ Market orders prioritize entry, not price. In a fast move, the hedge can fill wi
 
 If a hedge order fails because of insufficient funds or margin, the bot does not mark the hedge as complete. It logs `HEDGE_ORDER_FAILED` with `position_is_unhedged=true` and keeps retrying the same hedge side with the same `client_order_id`, so it does not intentionally duplicate the hedge. The open short strangle remains exposed until funds/margin are available or the exchange accepts and fills the hedge.
 
+If the hedge is rejected specifically for funds, margin, balance, or collateral, the bot switches to emergency close mode. It buys back the short call, buys back the short put, and sells any already-open long hedge legs. Each close leg also uses a fixed `client_order_id`, so a restart resumes the same close orders instead of duplicating them.
+
 The bot considers an expiry cycle done at `EXPIRY_CUTOFF_TIME`. Use 24-hour time, so `17:30` means 5:30 PM. It does not try to manage old expired positions after that time.
 
 ## Log Examples
@@ -140,5 +142,14 @@ Hedge problem:
 
 ```text
 HEDGE_ORDER_FAILED | side=upside | attempt=3 | symbol=C-BTC-120-061026 | qty=10 | error=insufficient_margin | retry_in=2s | position_is_unhedged=true
+```
+
+Emergency close:
+
+```text
+HEDGE_FUNDS_FAILURE | side=upside | symbol=C-BTC-120-061026 | qty=10 | error=insufficient_margin | action=close_all_existing_positions
+EMERGENCY_CLOSE_STARTED | cycle=BTC-06-10-2026-E0930 | reason=upside_hedge_funds_failure | qty=10 | call=C-BTC-110-061026 | put=P-BTC-90-061026 | up_hedge=none | down_hedge=none
+EMERGENCY_CLOSE_LEG_CONFIRMED | role=close_short_call | side=buy | qty=10 | client_oid=CCBTC06102026E0930
+EMERGENCY_CLOSE_CONFIRMED | cycle=BTC-06-10-2026-E0930 | reason=upside_hedge_funds_failure | status=closed
 ```
 

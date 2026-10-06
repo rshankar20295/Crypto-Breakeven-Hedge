@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
@@ -27,7 +28,7 @@ class StateStore:
         return sqlite3.connect(self.path)
 
     def _init(self) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cycles (
@@ -49,10 +50,11 @@ class StateStore:
                 )
                 """
             )
+            conn.commit()
 
     def save_cycle(self, cycle: CycleState) -> None:
         payload = json.dumps(asdict(cycle), cls=DecimalEncoder)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO cycles (cycle_id, status, payload, updated_at)
@@ -64,20 +66,21 @@ class StateStore:
                 """,
                 (cycle.cycle_id, cycle.status, payload),
             )
+            conn.commit()
 
     def load_cycle(self, cycle_id: str) -> CycleState | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute("SELECT payload FROM cycles WHERE cycle_id = ?", (cycle_id,)).fetchone()
         if not row:
             return None
         return self._decode_cycle(json.loads(row[0]))
 
     def active_cycle(self, underlying: str) -> CycleState | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 """
                 SELECT payload FROM cycles
-                WHERE status NOT IN ('settled', 'failed')
+                WHERE status NOT IN ('settled', 'failed', 'closed')
                 ORDER BY updated_at DESC LIMIT 1
                 """
             ).fetchone()
@@ -85,11 +88,11 @@ class StateStore:
             cycle = self._decode_cycle(json.loads(row[0]))
             if cycle.underlying == underlying:
                 return cycle
-            with self._connect() as conn:
+            with closing(self._connect()) as conn:
                 row = conn.execute(
                     """
                     SELECT payload FROM cycles
-                    WHERE status NOT IN ('settled', 'failed') AND updated_at < (
+                    WHERE status NOT IN ('settled', 'failed', 'closed') AND updated_at < (
                         SELECT updated_at FROM cycles WHERE cycle_id = ?
                     )
                     ORDER BY updated_at DESC LIMIT 1
@@ -99,7 +102,7 @@ class StateStore:
         return None
 
     def record_order(self, cycle_id: str, role: str, client_order_id: str, payload: dict[str, Any]) -> None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             conn.execute(
                 """
                 INSERT INTO orders (client_order_id, cycle_id, role, payload, updated_at)
@@ -110,9 +113,10 @@ class StateStore:
                 """,
                 (client_order_id, cycle_id, role, json.dumps(payload, cls=DecimalEncoder)),
             )
+            conn.commit()
 
     def has_order(self, client_order_id: str) -> bool:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute("SELECT 1 FROM orders WHERE client_order_id = ?", (client_order_id,)).fetchone()
         return row is not None
 
