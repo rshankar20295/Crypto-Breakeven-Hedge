@@ -118,5 +118,27 @@ This matters because `/app/data/bot_state.sqlite3` prevents duplicate hedge orde
 
 Market orders prioritize entry, not price. In a fast move, the hedge can fill with slippage. The bot retries until the hedge is confirmed, but it cannot guarantee the exact breakeven price.
 
+If a hedge order fails because of insufficient funds or margin, the bot does not mark the hedge as complete. It logs `HEDGE_ORDER_FAILED` with `position_is_unhedged=true` and keeps retrying the same hedge side with the same `client_order_id`, so it does not intentionally duplicate the hedge. The open short strangle remains exposed until funds/margin are available or the exchange accepts and fills the hedge.
+
 The bot considers an expiry cycle done at `EXPIRY_CUTOFF_TIME`. Use 24-hour time, so `17:30` means 5:30 PM. It does not try to manage old expired positions after that time.
+
+## Log Examples
+
+Normal monitoring:
+
+```text
+STATUS | cycle=BTC-06-10-2026-E0930 | spot=119.50 | pnl_est=64.20 | upper_be=120.00 | up_left=0.42% | lower_be=80.00 | down_left=33.05% | qty=10 | max_profit=100 | hedge_up=pending | hedge_down=pending
+```
+
+Hedge trigger:
+
+```text
+HEDGE_REQUIRED | side=upside | attempt=1 | action=buy | symbol=C-BTC-120-061026 | qty=10 | nearest_strike=120 | client_oid=HUBTC06102026E0930
+```
+
+Hedge problem:
+
+```text
+HEDGE_ORDER_FAILED | side=upside | attempt=3 | symbol=C-BTC-120-061026 | qty=10 | error=insufficient_margin | retry_in=2s | position_is_unhedged=true
+```
 

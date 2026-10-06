@@ -140,7 +140,8 @@ class BreakevenHedgeBot:
         down_left = self._percent_left(spot, cycle.lower_breakeven, upside=False)
         pnl = self._estimate_current_pnl(cycle)
         LOG.info(
-            "cycle=%s spot=%s pnl_est=%s upper_be=%s up_left=%s%% lower_be=%s down_left=%s%% up_hedged=%s down_hedged=%s",
+            "STATUS | cycle=%s | spot=%s | pnl_est=%s | upper_be=%s | up_left=%s%% | lower_be=%s | down_left=%s%% | "
+            "qty=%s | max_profit=%s | hedge_up=%s | hedge_down=%s",
             cycle.cycle_id,
             spot,
             pnl,
@@ -148,8 +149,10 @@ class BreakevenHedgeBot:
             up_left,
             cycle.lower_breakeven,
             down_left,
-            cycle.upside_hedged,
-            cycle.downside_hedged,
+            cycle.quantity,
+            cycle.actual_max_profit,
+            "done" if cycle.upside_hedged else "pending",
+            "done" if cycle.downside_hedged else "pending",
         )
 
         if spot >= cycle.upper_breakeven and not cycle.upside_hedged:
@@ -170,23 +173,50 @@ class BreakevenHedgeBot:
             oid = self._client_oid(cycle.cycle_id, "HD")
             role = "hedge_downside"
 
+        attempts = 0
         while True:
-            if self.store.has_order(oid):
-                order = self.client.get_order_by_client_oid(oid)
-                if order:
-                    size = int(order.get("size") or cycle.quantity)
-                    unfilled = int(order.get("unfilled_size") or 0)
-                    if size - unfilled >= cycle.quantity:
-                        self._mark_hedged(cycle, side, hedge.symbol, oid)
-                        return
-            LOG.warning("mandatory %s hedge: buying %s qty=%s nearest strike=%s", side, hedge.symbol, cycle.quantity, hedge.strike)
-            order = self.client.place_order(hedge.product_id, "buy", cycle.quantity, oid, self.settings.hedge_order_type)
-            self.store.record_order(cycle.cycle_id, role, oid, order)
-            filled, filled_size, _ = self.client.wait_for_fill(oid, cycle.quantity)
-            if filled:
-                self._mark_hedged(cycle, side, hedge.symbol, oid)
-                return
-            LOG.warning("%s hedge not fully filled yet filled=%s required=%s; retrying", side, filled_size, cycle.quantity)
+            attempts += 1
+            order = self.client.get_order_by_client_oid(oid)
+            if order:
+                self.store.record_order(cycle.cycle_id, role, oid, order)
+                size = int(order.get("size") or cycle.quantity)
+                unfilled = int(order.get("unfilled_size") or 0)
+                if size - unfilled >= cycle.quantity:
+                    self._mark_hedged(cycle, side, hedge.symbol, oid)
+                    return
+            LOG.warning(
+                "HEDGE_REQUIRED | side=%s | attempt=%s | action=buy | symbol=%s | qty=%s | nearest_strike=%s | client_oid=%s",
+                side,
+                attempts,
+                hedge.symbol,
+                cycle.quantity,
+                hedge.strike,
+                oid,
+            )
+            try:
+                order = self.client.place_order(hedge.product_id, "buy", cycle.quantity, oid, self.settings.hedge_order_type)
+                self.store.record_order(cycle.cycle_id, role, oid, order)
+                filled, filled_size, _ = self.client.wait_for_fill(oid, cycle.quantity)
+                if filled:
+                    self._mark_hedged(cycle, side, hedge.symbol, oid)
+                    return
+                LOG.critical(
+                    "HEDGE_NOT_FILLED | side=%s | filled=%s | required=%s | retry_in=%ss | position_is_unhedged=true",
+                    side,
+                    filled_size,
+                    cycle.quantity,
+                    self.settings.order_retry_seconds,
+                )
+            except Exception as exc:
+                LOG.critical(
+                    "HEDGE_ORDER_FAILED | side=%s | attempt=%s | symbol=%s | qty=%s | error=%s | retry_in=%ss | position_is_unhedged=true",
+                    side,
+                    attempts,
+                    hedge.symbol,
+                    cycle.quantity,
+                    exc,
+                    self.settings.order_retry_seconds,
+                )
             time.sleep(self.settings.order_retry_seconds)
 
     def _mark_hedged(self, cycle: CycleState, side: str, symbol: str, oid: str) -> None:
@@ -200,7 +230,7 @@ class BreakevenHedgeBot:
             cycle.downside_hedge_client_oid = oid
         cycle.status = "active"
         self.store.save_cycle(cycle)
-        LOG.info("%s hedge confirmed symbol=%s oid=%s", side, symbol, oid)
+        LOG.info("HEDGE_CONFIRMED | side=%s | symbol=%s | client_oid=%s", side, symbol, oid)
 
     def _select_expiry_date(self) -> str:
         products = self.client.get_products()
